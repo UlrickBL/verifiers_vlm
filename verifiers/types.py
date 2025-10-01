@@ -5,6 +5,7 @@ from typing import (
     Awaitable,
     Callable,
     Literal,
+    Optional
 )
 
 from openai.types.chat.chat_completion import ChatCompletion
@@ -88,6 +89,8 @@ class ProcessedOutputs(BaseModel):
 
     prompt_ids: list[list[int]]
     prompt_mask: list[list[int]]
+    image_grid_thw: Optional[list[Optional[list[int]]]] = None
+    pixel_values: Optional[list[Optional[list[list[float]]]]] = None
     completion_ids: list[list[int]]
     completion_mask: list[list[int]]
     completion_logprobs: list[list[float]]
