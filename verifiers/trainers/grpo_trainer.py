@@ -9,31 +9,48 @@ import inspect
 
 import datasets
 import numpy as np
-import torch
-import wandb
-from accelerate.utils import broadcast_object_list, gather_object, is_peft_model
-from peft import PeftConfig, get_peft_model
-from torch.utils.data import DataLoader, Sampler
-from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
-from transformers.modeling_utils import PreTrainedModel
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers import ProcessorMixin, AutoConfig
-from transformers.trainer import Trainer
-from transformers.trainer_callback import TrainerCallback
-from transformers.trainer_utils import seed_worker
-from trl.models import create_reference_model, prepare_deepspeed
-from trl.trainer.callbacks import SyncRefModelCallback
-from trl.trainer.utils import disable_dropout_in_model, pad, selective_log_softmax
-import base64
-from io import BytesIO
-import transformers
-
+import torch  # type: ignore[unresolved-import]
+import wandb  # type: ignore[unresolved-import]
+from accelerate.utils import (  # type: ignore[unresolved-import]
+    broadcast_object_list,
+    gather_object,
+    is_peft_model,
+)
+from peft import PeftConfig, get_peft_model  # type: ignore[unresolved-import]
+from torch.utils.data import DataLoader, Sampler  # type: ignore[unresolved-import]
+from transformers.integrations.deepspeed import (  # type: ignore[unresolved-import]
+    is_deepspeed_zero3_enabled,
+)
+from transformers.modeling_utils import (  # type: ignore[unresolved-import]
+    PreTrainedModel,
+)
+from transformers.tokenization_utils_base import (  # type: ignore[unresolved-import]
+    PreTrainedTokenizerBase,
+)
+from transformers.trainer import Trainer  # type: ignore[unresolved-import]
+from transformers.trainer_callback import (  # type: ignore[unresolved-import]
+    TrainerCallback,
+)
+from transformers import ProcessorMixin, AutoModelForCausalLM # type: ignore[unresolved-import]
+from transformers.trainer_utils import seed_worker  # type: ignore[unresolved-import]
+from trl.models import (  # type: ignore[unresolved-import]
+    create_reference_model,
+    prepare_deepspeed,
+)
+from trl.trainer.callbacks import (  # type: ignore[unresolved-import]
+    SyncRefModelCallback,
+)
+from trl.trainer.utils import (  # type: ignore[unresolved-import]
+    disable_dropout_in_model,
+    pad,
+    selective_log_softmax,
+)
 from verifiers import Environment
 from verifiers.trainers.async_batch_generator import AsyncBatchGenerator, BatchRequest
 from verifiers.trainers.async_dataloader_wrapper import AsyncDataLoaderWrapper
 from verifiers.trainers.grpo_config import GRPOConfig
 from verifiers.utils.logging_utils import print_prompt_completions_sample, serialize_for_wandb, extract_images
-
+from verifiers.utils.image_utils import pil_to_base64_url
 
 class RepeatSampler(Sampler):
     """
@@ -134,7 +151,12 @@ class RepeatSampler(Sampler):
                         yield index
 
     def __len__(self) -> int:
-        return (self.num_samples // self.batch_size) * self.batch_size * self.mini_repeat_count * self.repeat_count
+        return (
+            (self.num_samples // self.batch_size)
+            * self.batch_size
+            * self.mini_repeat_count
+            * self.repeat_count
+        )
 
 
 # torch.nanstd doesn't exist, so we define it here
@@ -188,31 +210,29 @@ def split_tensor_dict(
     ]
 
 
-def shuffle_tensor_dict(
-    tensor_dict: dict[str, Optional[torch.Tensor]],
-) -> dict[str, Optional[torch.Tensor]]:
+def shuffle_dict_with_lists(
+    data_dict: Dict[str, Optional[Union[torch.Tensor, List]]],
+) -> Dict[str, Optional[Union[torch.Tensor, List]]]:
     """
-    Shuffles a dictionary of tensors along the first dimension in unison.
-
-    Example:
-        >>> x = torch.arange(6).reshape(3, 2)
-        >>> y = torch.arange(3).reshape(3, 1)
-        >>> tensor_dict = {"x": x, "y": y}
-        >>> shuffle_tensor_dict(tensor_dict)
-        {'x': tensor([[2, 3],
-                      [0, 1],
-                      [4, 5]]),
-         'y': tensor([[1],
-                      [0],
-                      [2]])}
+    Shuffles a dictionary of tensors and/or lists along the first dimension in unison since pixel values can't be a schufflable tensor at the moment
     """
-    first_tensor = next(tensor for tensor in tensor_dict.values() if tensor is not None)
-    batch_size = first_tensor.shape[0]
+    first_item = next(item for item in data_dict.values() if item is not None)
+    batch_size = len(first_item)
+    
     permutation = torch.randperm(batch_size)
-    return {
-        key: tensor[permutation] if tensor is not None else None
-        for key, tensor in tensor_dict.items()
-    }
+    
+    shuffled_dict = {}
+    for key, value in data_dict.items():
+        if value is None:
+            shuffled_dict[key] = None
+        elif isinstance(value, torch.Tensor):
+            shuffled_dict[key] = value[permutation]
+        elif isinstance(value, list):
+            shuffled_dict[key] = [value[i] for i in permutation]
+        else:
+            shuffled_dict[key] = value    
+    return shuffled_dict
+
     
 def nanmin(tensor: torch.Tensor) -> torch.Tensor:
     """
@@ -242,15 +262,6 @@ def nanmax(tensor: torch.Tensor) -> torch.Tensor:
     if torch.isnan(tensor).all():
         return torch.tensor(float("nan"), dtype=tensor.dtype, device=tensor.device)
     return torch.max(tensor[~torch.isnan(tensor)])
-
-def pil_to_base64_url(pil_image) -> str:
-    """
-    Convert a PIL image to a base64 URL string suitable for OpenAI/vLLM messages.
-    """
-    buffered = BytesIO()
-    pil_image.save(buffered, format="PNG")
-    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{img_str}"
 
 class GRPOTrainer(Trainer):
     def __init__(
@@ -453,11 +464,11 @@ class GRPOTrainer(Trainer):
                 return len(prompt_ids) <= max_length
 
             original_size = len(train_dataset)
-            train_dataset = train_dataset.filter(
-                filter_by_prompt_length,
-                num_proc=self.max_data_workers,
-                fn_kwargs={"processing_class": processing_class}
-            )
+            #train_dataset = train_dataset.filter(
+            #    filter_by_prompt_length,
+            #    num_proc=self.max_data_workers,
+            #    fn_kwargs={"processing_class": processing_class},
+            #)
             filtered_size = len(train_dataset)
             if filtered_size < original_size:
                 self.logger.info(
@@ -520,9 +531,9 @@ class GRPOTrainer(Trainer):
         elif is_deepspeed_zero3_enabled():
             model_id = model.config._name_or_path
             model_init_kwargs = {"torch_dtype": "auto"}
-            config = AutoConfig.from_pretrained(model_id)
-            architecture = getattr(transformers, config.architectures[0])
-            self.ref_model = architecture.from_pretrained(model_id, **model_init_kwargs)
+            self.ref_model = AutoModelForCausalLM.from_pretrained(
+                model_id, **model_init_kwargs
+            )
         elif is_peft_model(model):
             # If PEFT is used, the reference model is not needed since the adapter can be disabled
             # to revert to the initial model.
@@ -755,14 +766,17 @@ class GRPOTrainer(Trainer):
         logits_to_keep,
         pixel_values=None,
         image_grid_thw=None,
-        pixel_attention_mask=None,
-        image_sizes=None,
     ):
         if is_peft_model(unwrapped_model):
             unwrapped_model = unwrapped_model.base_model.model
 
         # Build model inputs - check if the model supports logits_to_keep (some models and VLMs don't)
         model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
+
+        if pixel_values is not None:
+            model_inputs["pixel_values"] = pixel_values
+        if image_grid_thw is not None:
+            model_inputs["image_grid_thw"] = image_grid_thw
 
         last_hidden_state = unwrapped_model.model(**model_inputs).last_hidden_state
         # Exclude the last value: it corresponds to the next token pred
@@ -786,6 +800,7 @@ class GRPOTrainer(Trainer):
             0
         )  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
+
         for i in range(0, input_ids.size(0), batch_size):
             input_ids_batch = input_ids[i : i + batch_size]
             attention_mask_batch = attention_mask[i : i + batch_size]
@@ -794,10 +809,10 @@ class GRPOTrainer(Trainer):
             model_inputs = {"input_ids": input_ids_batch, "attention_mask": attention_mask_batch}
             
             if image_grid_thw is not None and pixel_values is not None:
-                model_inputs["image_grid_thw"] = image_grid_thw[i : i + batch_size]
-                start_pixel_idx = image_grid_thw[:i].prod(-1).sum().item()
-                end_pixel_idx = image_grid_thw[: i + batch_size].prod(-1).sum().item()
-                model_inputs["pixel_values"] = pixel_values[start_pixel_idx:end_pixel_idx]
+                model_inputs["pixel_values"] = pixel_values[i : i + batch_size]
+                model_inputs["image_grid_thw"]= image_grid_thw[i : i + batch_size]
+                model_inputs["pixel_values"] = torch.cat(model_inputs["pixel_values"], dim=0)
+                model_inputs["image_grid_thw"] = model_inputs["image_grid_thw"].reshape(-1, *model_inputs["image_grid_thw"].shape[2:])
             elif pixel_values is not None:
                 model_inputs["pixel_values"] = pixel_values[i : i + batch_size]
 
@@ -820,6 +835,7 @@ class GRPOTrainer(Trainer):
                 logits, input_ids_batch
             )  # compute logprobs for the input tokens
             all_logps.append(logps)
+
         return torch.cat(all_logps, dim=0)
 
     def _move_model_to_vllm(self):
@@ -827,7 +843,7 @@ class GRPOTrainer(Trainer):
         deepspeed_plugin = self.accelerator.state.deepspeed_plugin
         zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
         if zero_stage_3:
-            import deepspeed
+            import deepspeed  # type: ignore[unresolved-import]
 
             gather_if_zero3 = deepspeed.zero.GatheredParameters
         else:
@@ -974,43 +990,85 @@ class GRPOTrainer(Trainer):
     
     def _gather_batch_data(self, batch_offset: int = 0):
         """
-        Gather batch data from all processes and convert PIL images in prompts to base64 image_url.
+        Gather batch data from all processes and convert PIL images (single or multiple)
+        in prompts to base64 image_url.
+    
+        Handles:
+          - 'image': single PIL.Image
+          - 'images': list of PIL.Image objects (matched in order to placeholders)
+          - placeholders {"type": "image"}
+          - existing image_url (skipped)
+          - direct PIL.Image objects inside content
         """
+    
         batches = self._async_dataloader.peek_ahead(batch_offset)
-
-        if batch_offset == 0:
-            batch = batches[0] if batches else None
-        else:
-            batch = batches[batch_offset - 1] if batches else None
-
+    
+        if not batches:
+            return [], [], [], []
+    
+        batch = (
+            batches[0]
+            if batch_offset == 0
+            else batches[batch_offset - 1] if batch_offset - 1 < len(batches) else None
+        )
+    
         if batch is None:
             return [], [], [], []
-
+    
         if isinstance(batch, dict):
             batch = [batch]
-
+    
         prompts = []
+    
         for x in batch:
-            prompt = x["prompt"]
+            prompt = x.get("prompt", [])
+            single_image = x.get("image", None)
+            multiple_images = x.get("images", [])
+            img_index = 0  # track which image in x["images"] we're up to
+    
             for message in prompt:
                 content = message.get("content", [])
-                if isinstance(content, list):
-                    for c in content:
-                        if isinstance(c, dict) and c.get("type") == "image":
-                            img_url = pil_to_base64_url(x["image"])
+                if not isinstance(content, list):
+                    continue
+    
+                for i, c in enumerate(content):
+                    if hasattr(c, "save"):
+                        img_url = pil_to_base64_url(c)
+                        content[i] = {
+                            "type": "image_url",
+                            "image_url": {"url": img_url},
+                        }
+                        continue
+    
+                    if not isinstance(c, dict):
+                        continue
+    
+                    ctype = c.get("type")
+    
+                    if ctype == "image_url": #already an image_url -> skip
+                        continue
+                        
+                    if ctype == "image": # placeholder and we have an image list
+                        # Prefer multiple_images if available
+                        if multiple_images and img_index < len(multiple_images):
+                            pil_img = multiple_images[img_index]
+                            img_index += 1
+                        elif single_image is not None:
+                            pil_img = single_image
+                        else:
+                            pil_img = None
+    
+                        if pil_img is not None:
+                            img_url = pil_to_base64_url(pil_img)
                             c.clear()
                             c.update({
                                 "type": "image_url",
-                                "image_url": {"url": img_url}
+                                "image_url": {"url": img_url},
                             })
-                elif isinstance(content, str):
-                    pass
-                else:
-                    print("Unknown content type:", type(content))
     
             prompts.append(prompt)
     
-        answers = [x["answer"] for x in batch]
+        answers = [x.get("answer") for x in batch]
         tasks = [x.get("task", "default") for x in batch]
         infos = [x.get("info", {}) for x in batch]
     
@@ -1018,7 +1076,7 @@ class GRPOTrainer(Trainer):
         all_answers = gather_object(answers)
         all_tasks = gather_object(tasks)
         all_infos = gather_object(infos)
-    
+
         return all_prompts, all_answers, all_tasks, all_infos
 
     def _prepare_inputs(  # type: ignore
@@ -1036,7 +1094,6 @@ class GRPOTrainer(Trainer):
         self.accelerator.wait_for_everyone()
         # inputs = list of dicts for all gradient accumulation steps
         generate_every = self.gradient_accumulation_steps * self.num_iterations
-
         # Check if we need to generate new completions
         if self._step % generate_every == 0 or self._buffered_inputs is None:
             # Update weights to vLLM if needed
@@ -1220,8 +1277,11 @@ class GRPOTrainer(Trainer):
             attention_mask = pad(attention_mask_list, padding_side="right")  # type: ignore
 
             if has_images:
-                pixel_values = torch.stack(pixel_values_list, dim=0)
+                pixel_values = pixel_values_list
                 image_grid_thw = torch.stack(image_grid_list, dim=0)
+            else :
+                pixel_values = None
+                image_grid_thw = None
 
             # Truncate if needed
             if self.max_seq_len is not None and input_ids.size(1) > self.max_seq_len:
@@ -1254,12 +1314,24 @@ class GRPOTrainer(Trainer):
                     all_completion_ids=broadcast_data["completion_ids"],
                     all_prompt_mask=broadcast_data["prompt_mask"],
                 )
+            with torch.no_grad():
+                completion_mask = attention_mask[:, 1:]
+                logits_to_keep = completion_mask.size(1)
+                old_per_token_logps = self._get_per_token_logps(
+                    self.model,
+                    input_ids,
+                    attention_mask,
+                    pixel_values=pixel_values,   
+                    image_grid_thw=image_grid_thw,
+                    logits_to_keep=logits_to_keep,
+                    batch_size=self.per_device_train_batch_size
+                )
 
             # Concatenate all data for shuffling
             full_batch = {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
-                "old_per_token_logps": None,
+                "old_per_token_logps": old_per_token_logps,
                 "advantages": advantages,
             }
             if has_images:
@@ -1267,7 +1339,7 @@ class GRPOTrainer(Trainer):
                 full_batch["image_grid_thw"] = image_grid_thw
 
             # Shuffle and split for gradient accumulation
-            full_batch = shuffle_tensor_dict(full_batch)
+            full_batch = shuffle_dict_with_lists(full_batch)
             self._buffered_inputs = split_tensor_dict(
                 full_batch, self.gradient_accumulation_steps
             )

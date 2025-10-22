@@ -92,7 +92,6 @@ def cleanup_message(message: ChatMessage) -> ChatMessage:
 
     return cast(ChatMessage, new_message)
 
-
 def cleanup_messages(messages: Messages) -> Messages:
     if isinstance(messages, str):
         return messages

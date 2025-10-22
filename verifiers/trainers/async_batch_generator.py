@@ -4,13 +4,12 @@ import queue
 import threading
 import time
 from collections import deque
-from typing import Any
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
 from verifiers import GenerateOutputs
 from verifiers.types import ProcessedOutputs
-
 
 class BatchRequest(BaseModel):
     """Request for batch generation"""
@@ -38,7 +37,7 @@ class BatchResult(BaseModel):
         default_factory=list
     )  # Store completions for logging
     prompts: list[Any] = Field(default_factory=list)  # Store prompts for logging
-    answers : list[Any]
+    answers : Optional[list[Any]]
 
 
 class AsyncBatchGenerator:
@@ -265,6 +264,7 @@ class AsyncBatchGenerator:
         """
         # Call environment generation
         self.is_generating = True
+
         env_results = await self.env.a_generate(
             request.env_inputs,
             client=self.client,
@@ -273,6 +273,7 @@ class AsyncBatchGenerator:
             score_rollouts=True,
             max_concurrent=request.max_concurrent,
         )
+        
         self.is_generating = False
 
         # Extract all reward-related keys
@@ -282,6 +283,7 @@ class AsyncBatchGenerator:
         for k in env_results.metrics:
             all_reward_dict[k] = env_results.metrics[k]
 
+        
         # Process results
         processed_results = self.env.process_env_results_vllm(
             prompts=env_results.prompt,

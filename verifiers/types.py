@@ -1,11 +1,10 @@
 from typing import (
-    TYPE_CHECKING,
-    Annotated,
     Any,
     Awaitable,
     Callable,
     Literal,
-    Optional
+    Optional,
+    TypedDict,
 )
 
 from openai.types.chat.chat_completion import ChatCompletion
@@ -24,14 +23,10 @@ from openai.types.shared_params import (  # noqa: F401
     FunctionDefinition,
     FunctionParameters,
 )
-from pydantic import BaseModel, Field, SkipValidation
+from pydantic import BaseModel, Field
 
 # typing aliases
-if TYPE_CHECKING:
-    ChatMessage = ChatCompletionMessageParam
-else:
-    ChatMessage = Annotated[ChatCompletionMessageParam, SkipValidation]
-
+ChatMessage = ChatCompletionMessageParam
 MessageType = Literal["chat", "completion"]
 ModelResponse = Completion | ChatCompletion | None
 
@@ -60,8 +55,8 @@ class GenerateInputs(BaseModel):
 class GenerateOutputs(BaseModel):
     """Pydantic model for generation outputs."""
 
-    prompt: list[Messages]
-    completion: list[Messages]
+    prompt: list[list[dict]]
+    completion: list[list[dict]]
     answer: list[str]
     state: list[State]
     info: list[Info]
@@ -89,9 +84,13 @@ class ProcessedOutputs(BaseModel):
 
     prompt_ids: list[list[int]]
     prompt_mask: list[list[int]]
-    image_grid_thw: Optional[list[Optional[list[int]]]] = None
+    image_grid_thw: Optional[list[Optional[list[list[int]]]]] = None
     pixel_values: Optional[list[Optional[list[list[float]]]]] = None
     completion_ids: list[list[int]]
     completion_mask: list[list[int]]
     completion_logprobs: list[list[float]]
     rewards: list[float]
+
+
+Endpoint = TypedDict("Endpoint", {"key": str, "url": str, "model": str})
+Endpoints = dict[str, Endpoint]
